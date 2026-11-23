@@ -1,0 +1,2 @@
+charge_only_usd,lp_usd,binary_usd,binary_minus_lp_usd,saving_usd,binary_full_delivery_first_net_kw,binary_full_delivery_export_kwh,binary_battery_violation_kwh,binary_overlap_kw
+0.8999999999999999,0.6570000000000001,0.6569999999999999,-2.220446049250313e-16,0.243,-2.0,2.0,0,0

@@ -1,0 +1,3 @@
+* text=auto
+# Preserve the exact reference bytes verified by inputs_sha256.csv across platforms.
+inputs/**/*.json -text
