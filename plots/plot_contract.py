@@ -84,8 +84,8 @@ def render(output):
                 color=color, fontsize=7.8)
 
     period(155, "High-price hour", "30¢/kWh", HIGH)
-    transfer(129, "Driver delivers", "EV", "Site", "1", HIGH)
-    transfer(93, "Driver withdraws", "Grid", "Site", "1", HIGH)
+    transfer(129, "Discharge as planned", "EV", "Site", "1", HIGH)
+    transfer(93, "Discharge canceled", "Grid", "Site", "1", HIGH)
     period(58, "Low-price hour", "10¢/kWh", LOW)
     transfer(28, "In both cases", "Grid", "EV", "1.25", LOW)
     fig.savefig(output, metadata={"Title": "How a discharge withdrawal changes a station purchase"})
