@@ -184,25 +184,43 @@ def optimize(model, mode, price_vector=None, site_cap=None, audit=audit_schedule
     charge, discharge = np.zeros(a.shape), np.zeros(a.shape)
     charge[row,col] = last.x[:size]
     discharge[row,col] = last.x[size:2*size]
-    # Exact cycle removal preserves every battery trajectory and weakly lowers
-    # all physical imports under positive prices, including after withdrawals.
-    k = (ec * ed)[:,None]
-    cycle = np.minimum(charge, discharge / k)
+    # Removing a simultaneous charge/discharge cycle preserves the battery
+    # trajectory on delivery and leaves more room if the driver withdraws.
+    round_trip_efficiency = (ec * ed)[:, None]
+    cycle = np.minimum(charge, discharge / round_trip_efficiency)
     charge -= cycle
-    discharge -= k * cycle
-    net = load + charge.sum(axis=0) - discharge.sum(axis=0)
-    bill = np.maximum(net, 0) @ cost
-    delta = np.maximum(net[None,:] + discharge, 0) @ cost - bill
-    worst = bill + max(0, delta.max())
-    driver = int(delta.argmax()) if delta.max() > 1e-7 else None
-    worst_net = net - load + np.max(discharge, axis=0)
-    rating = np.maximum(load + model["Ulo"] * worst_net, load + model["Uhi"] * worst_net).max()
+    discharge -= round_trip_efficiency * cycle
+
+    nominal_import = load + charge.sum(axis=0) - discharge.sum(axis=0)
+    nominal_bill = np.maximum(nominal_import, 0) @ cost
+    # Each row cancels one driver's discharge for the entire session.
+    withdrawal_bills = np.maximum(nominal_import[None, :] + discharge, 0) @ cost
+    bill_increases = withdrawal_bills - nominal_bill
+    largest_increase = bill_increases.max()
+    worst_bill = nominal_bill + max(0, largest_increase)
+    driver = int(bill_increases.argmax()) if largest_increase > 1e-7 else None
+
+    peak_ev_load = nominal_import - load + np.max(discharge, axis=0)
+    rating = np.maximum(load + model["Ulo"] * peak_ev_load,
+                        load + model["Uhi"] * peak_ev_load).max()
     checks = audit(model, q, charge, discharge, optima["capacity"])
-    discrepancy = max(abs(bill - optima["nominal"]), abs(worst - optima["worst"]))
-    assert discrepancy < 1e-7 and abs(rating-optima["capacity"])<1e-6 and max(checks[k] for k in ("energy_residual_kwh","power_residual_kw","overlap_kw")) < 1e-6, (model["name"], discrepancy, checks)
-    return dict(nominal_usd=float(bill), worst_usd=float(worst), max_increment_usd=float(worst-bill), protected_peak_kw=float(rating),
-                min_net_kw=float(net.min()), discharge_kwh=float(np.sum(discharge*duration)),
-                withdrawal_ev_1based=driver+1 if driver is not None else "",
-                withdrawn_discharge_kwh=float(discharge[driver] @ duration) if driver is not None else 0.0,
-                energy_residual_kwh=checks["energy_residual_kwh"], power_residual_kw=checks["power_residual_kw"],
-                overlap_kw=checks["overlap_kw"], economic_check_usd=float(discrepancy))
+    discrepancy = max(abs(nominal_bill - optima["nominal"]), abs(worst_bill - optima["worst"]))
+    residuals = ("energy_residual_kwh", "power_residual_kw", "overlap_kw")
+    assert discrepancy < 1e-7, (model["name"], discrepancy)
+    assert abs(rating - optima["capacity"]) < 1e-6, (model["name"], rating, optima["capacity"])
+    assert max(checks[key] for key in residuals) < 1e-6, (model["name"], checks)
+
+    return {
+        "nominal_usd": float(nominal_bill),
+        "worst_usd": float(worst_bill),
+        "max_increment_usd": float(worst_bill - nominal_bill),
+        "protected_peak_kw": float(rating),
+        "min_net_kw": float(nominal_import.min()),
+        "discharge_kwh": float(np.sum(discharge * duration)),
+        "withdrawal_ev_1based": driver + 1 if driver is not None else "",
+        "withdrawn_discharge_kwh": float(discharge[driver] @ duration) if driver is not None else 0.0,
+        "energy_residual_kwh": checks["energy_residual_kwh"],
+        "power_residual_kw": checks["power_residual_kw"],
+        "overlap_kw": checks["overlap_kw"],
+        "economic_check_usd": float(discrepancy),
+    }

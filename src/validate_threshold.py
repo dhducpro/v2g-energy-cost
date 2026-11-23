@@ -104,12 +104,18 @@ class Fleet:
         return opt
 
     def scenario_row(self, owners, active_hours):
-        mask = active_hours[self.slot]
-        counts_discharge = ~np.isin(self.i,owners)
-        col = np.r_[np.flatnonzero(mask),self.nz+np.flatnonzero(mask & counts_discharge),self.z]
-        val = np.r_[self.w[self.slot[mask]],-self.w[self.slot[mask & counts_discharge]],-1.]
-        row = csr_matrix((val,(np.zeros(len(val),int),col)),shape=(1,self.ncols))
-        return row, -float(self.w[active_hours] @ self.load[active_hours])
+        """Bound the purchase bill for one set of withdrawals and import intervals."""
+        charging = np.flatnonzero(active_hours[self.slot])
+        discharging = charging[~np.isin(self.i[charging], owners)]
+
+        columns = np.r_[charging, self.nz + discharging, self.z]
+        weights = np.r_[self.w[self.slot[charging]], -self.w[self.slot[discharging]], -1.]
+        row = csr_matrix(
+            (weights, (np.zeros(len(weights), dtype=int), columns)),
+            shape=(1, self.ncols),
+        )
+        background_bill = self.w[active_hours] @ self.load[active_hours]
+        return row, -float(background_bill)
 
     def explicit(self,q):
         # Build a separate epigraph for every possible withdrawn set, using a
@@ -153,69 +159,102 @@ class Fleet:
             assert need<1e-8
         return total
 
-    def worst(self, net, d, q):
-        # Re-evaluate a physical schedule against the full clipped meter. When
-        # net >= 0, sign is fixed and the largest q whole-session exposures are exact.
-        value = d @ self.w
-        contributors = np.flatnonzero(value>0)
-        if q>=len(contributors):
-            candidates = [tuple(contributors)]
-        elif q==0:
-            candidates = [()]
-        elif min(net)>=-1e-10:
-            candidates = [tuple(np.argsort(-value)[:q])]
-        elif comb(len(contributors),q) <= 30000:
-            candidates = combinations(contributors,q)
-        else:
-            # Exact adversary: only intervals that can change sign need binary
-            # indicators in addition to one withdrawal bit per contributor.
-            n = len(contributors)
-            dv = d[contributors]
-            max_net = net + np.sort(dv,axis=0)[-q:].sum(axis=0)
-            pos = net>=0
-            mixed = np.flatnonzero((net<0) & (max_net>0))
-            k = len(mixed)
-            obj = np.r_[-(dv[:,pos] @ self.w[pos]),np.zeros(k),-self.w[mixed]]
-            rows = Rows()
-            rows.add(np.arange(n),np.ones(n),q)
-            for j,h in enumerate(mixed):
-                rows.add([n+j,n+k+j],[-max_net[h],1],0)
-                # if sign=1, y <= net + sum withdrawn d
-                rows.add(np.r_[np.arange(n),n+j,n+k+j],np.r_[-dv[:,h],-net[h],1],0)
-            B,b = rows.build(n+2*k)
-            ans = milp(obj,integrality=np.r_[np.ones(n+k),np.zeros(k)],
-                       bounds=Bounds(np.zeros(n+2*k),np.r_[np.ones(n+k),max_net[mixed]]),
-                       constraints=LinearConstraint(B,np.full(len(b),-np.inf),b), options={"mip_rel_gap":0.})
-            if not ans.success:
-                raise RuntimeError(ans.message)
-            candidates = [tuple(contributors[ans.x[:n]>.5])]
-        worst, best, best_mask = -np.inf, None, None
-        for owners in candidates:
-            physical = net+np.sum(d[list(owners)],axis=0)
-            bill = float(np.maximum(physical,0) @ self.w)
-            if bill > worst:
-                worst,best,best_mask = bill,owners,physical>0
-        return worst,best,best_mask
+    def _withdrawals_milp(self, net, discharge, q, contributors):
+        """Choose the worst withdrawals when too many sets exist to enumerate."""
+        supply = discharge[contributors]
+        count = len(contributors)
+        max_import = net + np.sort(supply, axis=0)[-q:].sum(axis=0)
+        importing = net >= 0
+        # Only these intervals can switch from export to import after a withdrawal.
+        mixed_hours = np.flatnonzero((net < 0) & (max_import > 0))
 
-    def protected(self,q):
-        # A signed bill is a valid lower bound on a zero-export-credit bill.
-        row,rhs = self.scenario_row((),np.ones(self.t,bool))
-        row = row + csr_matrix((np.r_[float(q),np.ones(self.n)],(np.zeros(self.n+1,int),np.r_[self.theta,self.r])),shape=(1,self.ncols))
-        A,b=vstack((self.A,row),format="csr"),np.r_[self.b,rhs]
-        iter_count=0
+        # Variables: one withdrawal flag per driver, then an import flag and
+        # a metered purchase for each interval that can switch sign.
+        num_mixed = len(mixed_hours)
+        num_flags = count + num_mixed
+        num_vars = num_flags + num_mixed
+        drivers = np.arange(count)
+        objective = np.r_[
+            -(supply[:, importing] @ self.w[importing]),
+            np.zeros(num_mixed),
+            -self.w[mixed_hours],
+        ]
+        rows = Rows()
+        rows.add(drivers, np.ones(count), q)
+        for index, hour in enumerate(mixed_hours):
+            flag = count + index
+            purchase = num_flags + index
+            rows.add([flag, purchase], [-max_import[hour], 1], 0)
+            # With the flag on, the purchase cannot exceed import after withdrawals.
+            rows.add(np.r_[drivers, flag, purchase], np.r_[-supply[:, hour], -net[hour], 1], 0)
+
+        matrix, upper = rows.build(num_vars)
+        result = milp(
+            objective,
+            integrality=np.r_[np.ones(num_flags), np.zeros(num_mixed)],
+            bounds=Bounds(np.zeros(num_vars), np.r_[np.ones(num_flags), max_import[mixed_hours]]),
+            constraints=LinearConstraint(matrix, np.full(len(upper), -np.inf), upper),
+            options={"mip_rel_gap": 0.},
+        )
+        if not result.success:
+            raise RuntimeError(result.message)
+        return tuple(contributors[result.x[:count] > .5])
+
+    def worst(self, net, d, q):
+        """Find the highest metered bill and the drivers whose withdrawals cause it."""
+        discharge_value = d @ self.w
+        contributors = np.flatnonzero(discharge_value > 0)
+        if q >= len(contributors):
+            candidates = [tuple(contributors)]
+        elif q == 0:
+            candidates = [()]
+        elif min(net) >= -1e-10:
+            # The station already imports in every interval; only total discharge value matters.
+            candidates = [tuple(np.argsort(-discharge_value)[:q])]
+        elif comb(len(contributors), q) <= 30000:
+            candidates = combinations(contributors, q)
+        else:
+            candidates = [self._withdrawals_milp(net, d, q, contributors)]
+
+        worst_bill = -np.inf
+        worst_owners = import_hours = None
+        for owners in candidates:
+            grid_import = net + np.sum(d[list(owners)], axis=0)
+            bill = float(np.maximum(grid_import, 0) @ self.w)
+            if bill > worst_bill:
+                worst_bill = bill
+                worst_owners = owners
+                import_hours = grid_import > 0
+        return worst_bill, worst_owners, import_hours
+
+    def protected(self, q):
+        """Add withdrawal scenarios until the worst metered bill meets the LP bound."""
+        # Start with the signed bill: crediting exports gives a lower bound on costs.
+        row, rhs = self.scenario_row((), np.ones(self.t, bool))
+        budget_row = csr_matrix(
+            (np.r_[float(q), np.ones(self.n)],
+             (np.zeros(self.n + 1, int), np.r_[self.theta, self.r])),
+            shape=(1, self.ncols),
+        )
+        matrix = vstack((self.A, row + budget_row), format="csr")
+        bounds = np.r_[self.b, rhs]
+        cuts = 0
         while True:
-            opt = self.solve(A,b)
-            if iter_count==0:
-                signed_lower=float(opt.fun)
-            net,d,energy,power = self.recover(opt.x)
-            worst,owners,mask=self.worst(net,d,q)
-            if worst-opt.fun<1e-7:
-                return float(opt.fun),float(worst),iter_count,energy,power,signed_lower
-            row,rhs=self.scenario_row(owners,mask)
-            A,b=vstack((A,row),format="csr"),np.r_[b,rhs]
-            iter_count+=1
-            if iter_count>600:
-                raise RuntimeError(("too many cuts",self.model["name"],q,worst-opt.fun))
+            solution = self.solve(matrix, bounds)
+            if cuts == 0:
+                signed_lower = float(solution.fun)
+            net, discharge, energy_error, power_error = self.recover(solution.x)
+            bill, owners, import_hours = self.worst(net, discharge, q)
+            gap = bill - solution.fun
+            if gap < 1e-7:
+                return float(solution.fun), float(bill), cuts, energy_error, power_error, signed_lower
+
+            row, rhs = self.scenario_row(owners, import_hours)
+            matrix = vstack((matrix, row), format="csr")
+            bounds = np.r_[bounds, rhs]
+            cuts += 1
+            if cuts > 600:
+                raise RuntimeError(("too many cuts", self.model["name"], q, gap))
 
 
 def write_csv(path,rows):
